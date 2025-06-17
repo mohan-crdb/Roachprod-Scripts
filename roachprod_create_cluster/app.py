@@ -1,1 +1,0 @@
-print('Calculator v1')
