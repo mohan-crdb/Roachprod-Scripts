@@ -14,6 +14,43 @@ cluster_exists() {
   run_roach list | awk '{print $1}' | grep -qw "$1"
 }
 
+# ───────────────────────────────────────────────────────────
+# Ensure $CLUSTER is set
+# ───────────────────────────────────────────────────────────
+if [[ -z "${CLUSTER:-}" ]]; then
+  cat <<EOF
+
+❌ The environment variable \$CLUSTER is not defined.
+   You must configure it before running this script.
+
+   Please follow the CockroachLabs Roachprod tutorial to set it up:
+     https://cockroachlabs.atlassian.net/wiki/spaces/TE/pages/144408811/Roachprod+Tutorial
+
+EOF
+  exit 1
+fi
+
+# ───────────────────────────────────────────────────────────
+# Detect roachprod build tag and set secure-flag support
+# ───────────────────────────────────────────────────────────
+ROACHPROD_BUILD_TAG=$(
+  roachprod -v 2>&1 \
+    | grep '^Build Tag:' \
+    | awk -F: '{print $2}' \
+    | xargs
+)
+
+version_lt() {
+  [ "$1" != "$2" ] \
+    && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -n1)" = "$1" ]
+}
+
+if version_lt "$ROACHPROD_BUILD_TAG" "v25.3.0-alpha.4-dev"; then
+  SEC_FLAG=""
+else
+  SEC_FLAG="--secure"
+fi
+
 # ----------------------------------------
 # FUNCTION: Unidirectional replication
 # ----------------------------------------
@@ -82,15 +119,15 @@ echo "--------------------------------------"
 echo "--------------------------------------"
   echo "🚦 Step 4: starting bank workload on $SRC_CLUSTER for 1m"
 echo "--------------------------------------"
-  PGURL=$(run_roach pgurl "$SRC_CLUSTER" --secure)
+  PGURL=$(run_roach pgurl "$SRC_CLUSTER" )
   echo "🔗 Using secure pgurl: $PGURL"
 
-  run_roach run "${SRC_CLUSTER}:1" --secure -- \
+  run_roach run "${SRC_CLUSTER}:1"  -- \
     "./cockroach workload init bank --db=$Unidirectional_LDR_DB $PGURL" &
 
   sleep 10
 
-  run_roach run "${SRC_CLUSTER}:1" --secure -- \
+  run_roach run "${SRC_CLUSTER}:1"  -- \
     "./cockroach workload run bank --db=$Unidirectional_LDR_DB --duration=1m '$PGURL'" &
 
   echo "⏳ Waiting 60s for workload to complete..."
@@ -98,7 +135,7 @@ echo "--------------------------------------"
 echo "--------------------------------------"
   echo "🔍 Verifying tables created by workload on $SRC_CLUSTER"
 echo "--------------------------------------"
-  run_roach run "${SRC_CLUSTER}:1" --secure -- \
+  run_roach run "${SRC_CLUSTER}:1"  -- \
     "./cockroach sql --certs-dir=certs -e \"USE ldr_db; SHOW TABLES;\""
 echo "--------------------------------------"
   echo "✅ Step 4 complete."
