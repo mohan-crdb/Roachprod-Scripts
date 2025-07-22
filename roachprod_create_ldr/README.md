@@ -4,7 +4,7 @@ This script automates the provisioning of two CockroachDB clusters and sets up L
 
 ## Prerequisites
 
-* **roachprod** installed and configured ([https://www.cockroachlabs.com/docs/stable/roachprod.html](https://www.cockroachlabs.com/docs/stable/roachprod.html)).
+* **roachprod** installed and configured: https://cockroachlabs.atlassian.net/wiki/spaces/TE/pages/144408811/Roachprod+Tutorial.
 * **CockroachDB certificates** available under `certs/` on each node.
 * AWS credentials/profiles set (uses `--aws-profile crl-revenue` by default).
 * `bash` shell with support for `set -euo pipefail`.
