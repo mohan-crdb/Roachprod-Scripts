@@ -27,13 +27,13 @@ This script automates the provisioning of two CockroachDB clusters and sets up L
 1. Make the script executable:
 
    ```bash
-   chmod +x create-ldr-cluster-copy.sh
+   chmod +x create-ldr-cluster-main.sh
    ```
 
 2. Run it:
 
    ```bash
-   ./create-ldr-cluster-copy.sh
+   ./create-ldr-cluster-main.sh
    ```
 
 3. Follow the prompts:
