@@ -11,9 +11,19 @@ run_roach() {
 
 # Function to check if a cluster exists in roachprod
 cluster_exists() {
-  run_roach list | awk '{print $1}' | grep -qw "$1"
+  # Skip the header (NR>1), take only the first column, then do
+  # an exact, full‐line match of $1
+  run_roach list \
+    | awk 'NR>1 {print $1}' \
+    | grep -Fxq "$1"
 }
-
+prefix_exists() {
+  local prefix=$1
+  # grab only the name column, then look for prefix followed by dash or EOL
+  run_roach list \
+    | awk 'NR>1 {print $1}' \
+    | grep -Eiq "^${prefix}(-|$)"
+}
 # ───────────────────────────────────────────────────────────
 # Ensure $CLUSTER is set
 # ───────────────────────────────────────────────────────────
@@ -296,15 +306,18 @@ if [[ "$USER_INPUT" != "$CLUSTER" ]]; then
   exit 1
 fi
 
-if run_roach list | grep -qw "$SRC_CLUSTER"; then
+if cluster_exists "$SRC_CLUSTER"; then
   echo "❌ Source cluster '$SRC_CLUSTER' already exists. Aborting."
   exit 1
 fi
-if run_roach list | grep -qw "$TGT_CLUSTER"; then
+
+if cluster_exists "$TGT_CLUSTER"; then
   echo "❌ Target cluster '$TGT_CLUSTER' already exists. Aborting."
   exit 1
 fi
+
 echo "✅ All Good"
+
 read -p "Enter number of nodes (>=1): " NUM_NODES
 read -p "Enter CRDB version (format v24.3.x): " CRDB_VERSION
 
@@ -335,15 +348,18 @@ if [[ "$lc_extend" == "yes" ]]; then
 fi
 echo "--------------------------------------"
 echo "🚀 Creating clusters..."
+# AWS login
+PROFILE=$(egrep sso_account_id ~/.aws/config -B 3 | grep profile | awk '{print $2}' | sed -e 's|\]||g')
+aws sso login --profile crl-revenue
 {
   run_roach create -n "$NUM_NODES" "$SRC_CLUSTER" --aws-profile crl-revenue
   run_roach stage  "$SRC_CLUSTER" release "$CRDB_VERSION"
-  run_roach start  "$SRC_CLUSTER" --secure
+  run_roach start  "$SRC_CLUSTER"
 
   run_roach create -n "$NUM_NODES" "$TGT_CLUSTER" --aws-profile crl-revenue
   run_roach stage  "$TGT_CLUSTER" release "$CRDB_VERSION"
-  run_roach start  "$TGT_CLUSTER" --secure
-} &> /dev/null
+  run_roach start  "$TGT_CLUSTER"
+}
 
 if [[ "$lc_extend" == "yes" ]]; then
   run_roach extend "$SRC_CLUSTER" -l "$EXTEND_VAL"
