@@ -1,0 +1,253 @@
+---
+- name: Set up LDR with roachprod (secure clusters only, uni/bidi)
+  hosts: localhost
+  gather_facts: false
+
+  vars_prompt:
+    - name: src_cluster
+      prompt: "Enter source cluster name (format <username>-<cluster>)"
+      private: no
+    - name: tgt_cluster
+      prompt: "Enter target cluster name (format <username>-<cluster>)"
+      private: no
+    - name: num_nodes
+      prompt: "Enter number of nodes (>=1)"
+      private: no
+    - name: crdb_version
+      prompt: "Enter CRDB version (format v24.3.x)"
+      private: no
+    - name: extend_choice
+      prompt: "Extend cluster lifetime? (yes/no)"
+      private: no
+      default: "no"
+    - name: extend_val
+      prompt: "Enter extension (e.g. 7h) [ignored if 'no']"
+      private: no
+      default: ""
+    - name: ldr_mode
+      prompt: "Choose LDR mode: (a) unidirectional or (b) bidirectional"
+      private: no
+
+  vars:
+    ldr_db: "ldr_db"
+    ldr_table_fq: "{{ ldr_db }}.public.bank"
+    roachprod_warn_filter: "grep -v -E 'WARN: running insecure mode|cockroach-system is running; see: systemctl status cockroach-system'"
+    auth_flag: "--certs-dir=certs"
+
+  pre_tasks:
+    - name: Validate clusters are different
+      fail:
+        msg: "Source and target cluster names must be different."
+      when: src_cluster == tgt_cluster
+
+    - name: Validate CRDB version format
+      assert:
+        that: crdb_version is match('^v[0-9]+\\.[0-9]+\\.[0-9]+$')
+        fail_msg: "Expected v<major>.<minor>.<patch>"
+
+    - name: Compute major.minor
+      set_fact:
+        crdb_major_minor: "{{ crdb_version | regex_replace('^v','') | regex_replace('\\.[0-9]+$','') }}"
+
+    - name: Derive usernames and connection names
+      set_fact:
+        src_user: "{{ (src_cluster + '_ldr_user01') | regex_replace('-', '_') }}"
+        tgt_user: "{{ (tgt_cluster + '_ldr_user01') | regex_replace('-', '_') }}"
+        ext_conn_name: "{{ (src_cluster + '_source') | regex_replace('-', '_') }}"
+        second_src_user: "{{ (tgt_cluster + '_ldr_user02') | regex_replace('-', '_') }}"
+        second_tgt_user: "{{ (src_cluster + '_ldr_user02') | regex_replace('-', '_') }}"
+
+  tasks:
+    # ---------------------------
+    # Cluster creation (secure)
+    # ---------------------------
+    - name: Discover AWS profile
+      shell: |
+        egrep sso_account_id ~/.aws/config -B 3 | grep profile | awk '{print $2}' | sed -e 's|\]||g'
+      register: aws_profile
+      changed_when: false
+
+    - name: AWS SSO login
+      shell: "aws sso login --profile {{ aws_profile.stdout }}"
+      changed_when: false
+
+    - name: List clusters
+      shell: "roachprod list | awk 'NR>1 {print $1}' | {{ roachprod_warn_filter }}"
+      register: rp_clusters
+      changed_when: false
+
+    - name: Create clusters if missing
+      shell: "roachprod create -n {{ num_nodes }} {{ item }} --aws-profile {{ aws_profile.stdout }} | {{ roachprod_warn_filter }}"
+      loop:
+        - "{{ src_cluster }}"
+        - "{{ tgt_cluster }}"
+      when: item not in rp_clusters.stdout_lines | default([])
+
+    - name: Stage CRDB release
+      shell: "roachprod stage {{ item }} release {{ crdb_version }} | {{ roachprod_warn_filter }}"
+      loop:
+        - "{{ src_cluster }}"
+        - "{{ tgt_cluster }}"
+
+    - name: Start clusters (secure)
+      shell: "roachprod start {{ item }} --secure | {{ roachprod_warn_filter }}"
+      loop:
+        - "{{ src_cluster }}"
+        - "{{ tgt_cluster }}"
+
+    - name: Get primary IPs
+      shell: "roachprod ip {{ item }} | head -n1"
+      loop:
+        - "{{ src_cluster }}"
+        - "{{ tgt_cluster }}"
+      register: rp_ips
+      changed_when: false
+
+    - set_fact:
+        src_ip: "{{ (rp_ips.results | selectattr('item','equalto', src_cluster) | first).stdout | trim }}"
+        tgt_ip: "{{ (rp_ips.results | selectattr('item','equalto', tgt_cluster) | first).stdout | trim }}"
+
+    # ---------------------------
+    # Unidirectional LDR setup (secure)
+    # ---------------------------
+    - block:
+        - name: Configure replication users + rangefeed
+          shell: >
+            roachprod run {{ item.cluster }}:1
+            "./cockroach sql {{ auth_flag }} -e
+            \"SET CLUSTER SETTING kv.rangefeed.enabled = true;
+              CREATE USER {{ item.user }} WITH PASSWORD 'a';
+              GRANT SYSTEM REPLICATION TO {{ item.user }};\""
+          loop:
+            - { cluster: "{{ src_cluster }}", user: "{{ src_user }}" }
+            - { cluster: "{{ tgt_cluster }}", user: "{{ tgt_user }}" }
+
+        - name: Create LDR database
+          shell: >
+            roachprod run {{ item }}:1
+            "./cockroach sql {{ auth_flag }} -e 'CREATE DATABASE IF NOT EXISTS {{ ldr_db }};'"
+          loop:
+            - "{{ src_cluster }}"
+            - "{{ tgt_cluster }}"
+
+        - name: Encode SOURCE URI (secure)
+          shell: >
+            roachprod run {{ src_cluster }}:1
+            "./cockroach encode-uri postgres://{{ src_user }}:a@{{ src_ip }}:26257/
+            --ca-cert /home/ubuntu/certs/ca.crt --inline"
+          register: raw_source_uri
+
+        - name: Compute source_conn_str
+          set_fact:
+            source_conn_str: >-
+              {{ raw_source_uri.stdout
+                 | regex_replace('/defaultdb','')
+                 | regex_replace('^postgres://','postgresql://')
+                 | trim }}
+
+        - name: Create EXTERNAL CONNECTION on TARGET
+          shell: >
+            roachprod run {{ tgt_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ auth_flag }} -e
+            \"CREATE EXTERNAL CONNECTION {{ ext_conn_name }} AS '{{ source_conn_str }}';\""
+
+        - name: Stage workload binary
+          shell: "roachprod stage {{ src_cluster }} workload | {{ roachprod_warn_filter }}"
+
+        - name: Init + run workload
+          shell: >
+            roachprod run {{ src_cluster }}:1 --
+            "./cockroach workload init bank --db={{ ldr_db }};
+             ./cockroach workload run bank --db={{ ldr_db }} --duration=1m"
+
+        - pause:
+            seconds: 60
+
+        - name: Create empty table on TARGET
+          shell: >
+            roachprod run {{ tgt_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ auth_flag }} -e
+            \"USE {{ ldr_db }};
+              CREATE TABLE IF NOT EXISTS {{ ldr_table_fq }} (
+                id INT8 NOT NULL,
+                balance INT8 NULL,
+                payload STRING NULL,
+                CONSTRAINT bank_pkey PRIMARY KEY (id ASC)
+              );\""
+
+        - name: Start LDR stream (SOURCE → TARGET)
+          shell: >
+            roachprod run {{ tgt_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ auth_flag }} -e
+            \"CREATE LOGICAL REPLICATION STREAM
+               FROM TABLE {{ ldr_table_fq }}
+               ON 'external://{{ ext_conn_name }}'
+               INTO TABLE {{ ldr_table_fq }}
+               WITH MODE = validated;\""
+
+      when: ldr_mode | lower is match('^a|^b')
+
+    # ---------------------------
+    # Bidirectional setup (secure)
+    # ---------------------------
+    - block:
+        - name: Configure second replication users
+          shell: >
+            roachprod run {{ item.cluster }}:1
+            "./cockroach sql {{ auth_flag }} -e
+            \"SET CLUSTER SETTING kv.rangefeed.enabled = true;
+              CREATE USER {{ item.user }} WITH PASSWORD 'a';
+              GRANT SYSTEM REPLICATION TO {{ item.user }};\""
+          loop:
+            - { cluster: "{{ tgt_cluster }}", user: "{{ second_src_user }}" }
+            - { cluster: "{{ src_cluster }}", user: "{{ second_tgt_user }}" }
+
+        - name: Encode reverse (TARGET) URI
+          shell: >
+            roachprod run {{ tgt_cluster }}:1
+            "./cockroach encode-uri postgres://{{ second_src_user }}:a@{{ tgt_ip }}:26257/
+            --ca-cert /home/ubuntu/certs/ca.crt --inline"
+          register: raw_reverse_uri
+
+        - name: Compute reverse_conn_str
+          set_fact:
+            reverse_conn_str: >-
+              {{ raw_reverse_uri.stdout
+                 | regex_replace('/defaultdb','')
+                 | regex_replace('^postgres://','postgresql://')
+                 | trim }}
+
+        - name: Create reverse EXTERNAL CONNECTION
+          shell: >
+            roachprod run {{ src_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ auth_flag }} -e
+            \"CREATE EXTERNAL CONNECTION {{ (second_src_user + '_rev_src') | regex_replace('-', '_') }}
+               AS '{{ reverse_conn_str }}';\""
+
+        - name: Insert rows on TARGET for reverse replication
+          shell: >
+            roachprod run {{ tgt_cluster }}:1
+            "./cockroach sql {{ auth_flag }} -e
+            \"USE {{ ldr_db }};
+              INSERT INTO {{ ldr_table_fq }} VALUES
+              (2001, 200, 'reverse1'),
+              (2002, 400, 'reverse2');\""
+
+        - pause:
+            seconds: 60
+
+        - name: Start reverse LDR stream (TARGET → SOURCE)
+          shell: >
+            roachprod run {{ src_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ auth_flag }} -e
+            \"CREATE LOGICAL REPLICATION STREAM
+               FROM TABLE {{ ldr_table_fq }}
+               ON 'external://{{ (second_src_user + '_rev_src') | regex_replace('-', '_') }}'
+               INTO TABLE {{ ldr_table_fq }}
+               WITH MODE = validated;\""
+
+      when: ldr_mode | lower is match('^b')
+
+  post_tasks:
+    - debug:
+        msg: ["✅ Secure LDR setup complete ({{ 'bidirectional' if (ldr_mode | lower is match('^b')) else 'unidirectional' }})"]

@@ -55,7 +55,7 @@ trap cleanup SIGINT SIGTERM EXIT
 
 # AWS login
 PROFILE=$(egrep sso_account_id ~/.aws/config -B 3 | grep profile | awk '{print $2}' | sed -e 's|\]||g')
-aws sso login --profile crl-revenue
+aws sso login --profile $PROFILE
 
 # Create Roachprod cluster
 echo "Creating cluster $cluster_name with $num_vms VMs..."
@@ -67,4 +67,4 @@ roachprod extend "$cluster_name" --lifetime="$lifetime"
 
 # Stage and start
 roachprod stage "$cluster_name" release "$version"
-roachprod start "$cluster_name"
+roachprod start "$cluster_name" --secure

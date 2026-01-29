@@ -331,13 +331,13 @@ echo "--------------------------------------"
 echo "🚀 Creating clusters..."
 # AWS login
 PROFILE=$(egrep sso_account_id ~/.aws/config -B 3 | grep profile | awk '{print $2}' | sed -e 's|\]||g')
-aws sso login --profile $PROFILE
+aws sso login --profile crl-revenue
 {
-  run_roach create -n "$NUM_NODES" "$SRC_CLUSTER" --aws-profile $PROFILE
+  run_roach create -n "$NUM_NODES" "$SRC_CLUSTER" --aws-profile crl-revenue
   run_roach stage  "$SRC_CLUSTER" release "$CRDB_VERSION"
   run_roach start  "$SRC_CLUSTER" $SEC_FLAG
 
-  run_roach create -n "$NUM_NODES" "$TGT_CLUSTER" --aws-profile $PROFILE
+  run_roach create -n "$NUM_NODES" "$TGT_CLUSTER" --aws-profile crl-revenue
   run_roach stage  "$TGT_CLUSTER" release "$CRDB_VERSION"
   run_roach start  "$TGT_CLUSTER" $SEC_FLAG
 }

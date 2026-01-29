@@ -9,17 +9,54 @@ run_roach() {
     | grep -v -E 'WARN: running insecure mode|cockroach-system is running; see: systemctl status cockroach-system'
 }
 
+# ----------------------------------------
 # Function to check if a cluster exists in roachprod
+# ----------------------------------------
 cluster_exists() {
-  run_roach list | awk '{print $1}' | grep -qw "$1"
+  run_roach list \
+    | awk 'NR>1 {print $1}' \
+    | grep -Fxq "$1"
 }
 
+prefix_exists() {
+  local prefix=$1
+  run_roach list \
+    | awk 'NR>1 {print $1}' \
+    | grep -Eiq "^${prefix}(-|$)"
+}
+# ----------------------------------------
+# Detect roachprod build tag and set secure flag threshold at v25.2.0
+# ----------------------------------------
+ROACHPROD_BUILD_TAG=$(roachprod version 2>&1 \
+  | grep -i "build tag" \
+  | awk -F': ' '{print $2}' \
+  | xargs \
+  | cut -d- -f1)
+
+# 2) strip leading “v” and split into numbers:
+bt="${ROACHPROD_BUILD_TAG#v}"
+IFS=. read -r maj min pat <<< "$bt"
+
+# 3) threshold components:
+req_maj=25
+req_min=2
+req_pat=0
+
+# 4) strict “greater than” logic → only newer than 25.2.0:
+if (( maj > req_maj )) \
+   || (( maj == req_maj && min > req_min )) \
+   || (( maj == req_maj && min == req_min && pat > req_pat )); then
+  SEC_FLAG="--secure"
+else
+  SEC_FLAG=""
+fi
+
+echo "build-tag = $ROACHPROD_BUILD_TAG → SEC_FLAG='$SEC_FLAG'"
 # ----------------------------------------
 # FUNCTION: Unidirectional replication
 # ----------------------------------------
 run_unidirectional() {
 
-echo "🔄 Unidirectional LDR: running steps to configure.."
 echo "--------------------------------------"
   SRC_USER=$(echo "${SRC_CLUSTER}_ldr_user01" | tr '-' '_')
   TGT_USER=$(echo "${TGT_CLUSTER}_ldr_user01" | tr '-' '_')
@@ -79,29 +116,24 @@ echo "--------------------------------------"
   echo "📦 Staging workload binary on $SRC_CLUSTER"
 echo "--------------------------------------"
   run_roach stage "$SRC_CLUSTER" workload
-echo "--------------------------------------"
-  echo "🚦 Step 4: starting bank workload on $SRC_CLUSTER for 1m"
-echo "--------------------------------------"
-  PGURL=$(run_roach pgurl "$SRC_CLUSTER" --secure)
-  echo "🔗 Using secure pgurl: $PGURL"
 
-  run_roach run "${SRC_CLUSTER}:1" --secure -- \
-    "./cockroach workload init bank --db=$Unidirectional_LDR_DB $PGURL" &
+echo "🚦 Running bank workload for 1m"
+PGURL=$(run_roach pgurl "$SRC_CLUSTER" $SEC_FLAG)
+run_roach run "$SRC_CLUSTER:1" $SEC_FLAG -- \
+  "./cockroach workload init bank --db=ldr_db $PGURL" &
+sleep 10
+run_roach run "$SRC_CLUSTER:1" $SEC_FLAG -- \
+  "./cockroach workload run bank --db=ldr_db --duration=1m '$PGURL'" &
 
-  sleep 10
+echo "⏳ Waiting 60s for workload to complete..."
+sleep 60
 
-  run_roach run "${SRC_CLUSTER}:1" --secure -- \
-    "./cockroach workload run bank --db=$Unidirectional_LDR_DB --duration=1m '$PGURL'" &
-
-  echo "⏳ Waiting 60s for workload to complete..."
-  sleep 60
 echo "--------------------------------------"
   echo "🔍 Verifying tables created by workload on $SRC_CLUSTER"
 echo "--------------------------------------"
-  run_roach run "${SRC_CLUSTER}:1" --secure -- \
+  run_roach run "${SRC_CLUSTER}:1"  -- \
     "./cockroach sql --certs-dir=certs -e \"USE ldr_db; SHOW TABLES;\""
-echo "--------------------------------------"
-  echo "✅ Step 4 complete."
+
 echo "--------------------------------------"
   echo "✏️  Creating empty bank table on destination ($TGT_CLUSTER)"
 echo "--------------------------------------"
@@ -146,6 +178,9 @@ echo "--------------------------------------"
 echo "✅ Unidirectional LDR setup complete"
 }
 
+# ----------------------------------------
+# FUNCTION: Bidirectional replication
+# ----------------------------------------
 run_bidirectional() {
 
   # First do the uni-directional half
@@ -252,23 +287,19 @@ echo "Enter Cluster Details:"
 echo "--------------------------------------"
 read -p "Enter source cluster name (format <username>-<cluster>): " SRC_CLUSTER
 read -p "Enter target cluster name (format <username>-<cluster>): " TGT_CLUSTER
-echo "Validating $SRC_CLUSTER and $TGT_CLUSTER cluster names, please wait.."
 USER_INPUT=$(echo "$SRC_CLUSTER" | cut -d'-' -f1)
-if [[ "$USER_INPUT" != "$CLUSTER" ]]; then
-  echo "❌ Username part ($USER_INPUT) does not match \$CLUSTER ($CLUSTER)"
+
+if [[ "$SRC_CLUSTER" == "$TGT_CLUSTER" ]]; then
+  echo "❌ Source and target cluster names must be different."
   exit 1
 fi
 
-if run_roach list | grep -qw "$SRC_CLUSTER"; then
-  echo "❌ Source cluster '$SRC_CLUSTER' already exists. Aborting."
-  exit 1
-fi
-if run_roach list | grep -qw "$TGT_CLUSTER"; then
-  echo "❌ Target cluster '$TGT_CLUSTER' already exists. Aborting."
-  exit 1
-fi
-echo "✅ All Good"
 read -p "Enter number of nodes (>=1): " NUM_NODES
+if ! [[ "$NUM_NODES" =~ ^[0-9]+$ ]] || (( NUM_NODES < 1 )); then
+  echo "❌ Number of nodes must be a positive integer (>=1)."
+  exit 1
+fi
+
 read -p "Enter CRDB version (format v24.3.x): " CRDB_VERSION
 
 # 1) validate basic format: must start with 'v' and have three numeric components
@@ -298,15 +329,18 @@ if [[ "$lc_extend" == "yes" ]]; then
 fi
 echo "--------------------------------------"
 echo "🚀 Creating clusters..."
+# AWS login
+PROFILE=$(egrep sso_account_id ~/.aws/config -B 3 | grep profile | awk '{print $2}' | sed -e 's|\]||g')
+aws sso login --profile $PROFILE
 {
-  run_roach create -n "$NUM_NODES" "$SRC_CLUSTER" --aws-profile crl-revenue
+  run_roach create -n "$NUM_NODES" "$SRC_CLUSTER" --aws-profile $PROFILE
   run_roach stage  "$SRC_CLUSTER" release "$CRDB_VERSION"
-  run_roach start  "$SRC_CLUSTER" --secure
+  run_roach start  "$SRC_CLUSTER" $SEC_FLAG
 
-  run_roach create -n "$NUM_NODES" "$TGT_CLUSTER" --aws-profile crl-revenue
+  run_roach create -n "$NUM_NODES" "$TGT_CLUSTER" --aws-profile $PROFILE
   run_roach stage  "$TGT_CLUSTER" release "$CRDB_VERSION"
-  run_roach start  "$TGT_CLUSTER" --secure
-} &> /dev/null
+  run_roach start  "$TGT_CLUSTER" $SEC_FLAG
+}
 
 if [[ "$lc_extend" == "yes" ]]; then
   run_roach extend "$SRC_CLUSTER" -l "$EXTEND_VAL"
@@ -329,7 +363,7 @@ case "$lc_mode" in
     run_unidirectional
     ;;
   b*)
-    echo "🔄 Bidirectional LDR: running uni-directional then bi-directional steps"
+    echo "🔄 Choice selected is Bi-directional LDR: The Script will run Uni-directional first then setup Bi-directional LDR for the same database"
     run_bidirectional
     ;;
   *)
@@ -337,4 +371,3 @@ case "$lc_mode" in
     exit 1
     ;;
 esac
-

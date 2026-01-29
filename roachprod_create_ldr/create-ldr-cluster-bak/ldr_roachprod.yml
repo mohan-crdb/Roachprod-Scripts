@@ -1,0 +1,505 @@
+---
+- name: Set up LDR with roachprod (secure/insecure aware, per-cluster probes)
+  hosts: localhost
+  gather_facts: false
+
+  vars_prompt:
+    - name: src_cluster
+      prompt: "Enter source cluster name (format <username>-<cluster>)"
+      private: no
+    - name: tgt_cluster
+      prompt: "Enter target cluster name (format <username>-<cluster>)"
+      private: no
+    - name: num_nodes
+      prompt: "Enter number of nodes (>=1)"
+      private: no
+    - name: crdb_version
+      prompt: "Enter CRDB version (format v24.3.x)"
+      private: no
+    - name: extend_choice
+      prompt: "Extend cluster lifetime? (yes/no)"
+      private: no
+      default: "no"
+    - name: extend_val
+      prompt: "Enter extension (e.g. 7h) [ignored if 'no']"
+      private: no
+      default: ""
+    - name: ldr_mode
+      prompt: "Choose LDR mode: (a) unidirectional or (b) bidirectional"
+      private: no
+
+  vars:
+    ldr_db: "ldr_db"
+    ldr_table_fq: "{{ ldr_db }}.public.bank"
+    roachprod_warn_filter: "grep -v -E 'WARN: running insecure mode|cockroach-system is running; see: systemctl status cockroach-system'"
+
+  pre_tasks:
+    - name: Validate clusters are different
+      fail:
+        msg: "Source and target cluster names must be different."
+      when: src_cluster == tgt_cluster
+
+    - name: Validate node count is a positive integer
+      assert:
+        that:
+          - num_nodes is match('^[0-9]+$')
+          - (num_nodes | int) >= 1
+        fail_msg: "Number of nodes must be a positive integer (>=1)."
+
+    - name: Validate CRDB version format (v<major>.<minor>.<patch>)
+      assert:
+        that: crdb_version is match('^v[0-9]+\\.[0-9]+\\.[0-9]+$')
+        fail_msg: "Invalid version format. Expected v<major>.<minor>.<patch> (e.g. v24.3.9)."
+
+    - name: Compute <major.minor> from CRDB version
+      set_fact:
+        crdb_major_minor: "{{ crdb_version | regex_replace('^v','') | regex_replace('\\.[0-9]+$','') }}"
+
+    - name: Enforce LDR supported bounds (>=24.3; disallow 25.* like your Bash)
+      fail:
+        msg: "Version < 24.3 does not support LDR."
+      when: crdb_major_minor is version('24.3', '<')
+
+    - name: Disallow v25.x (kept identical to your Bash)
+      fail:
+        msg: "v25.x is not supported yet. Aborting."
+      when: crdb_version is match('^v25\\..*')
+
+    - name: Derive sanitized users & ext-conn names (replace '-' with '_')
+      set_fact:
+        src_user: "{{ (src_cluster + '_ldr_user01') | regex_replace('-', '_') }}"
+        tgt_user: "{{ (tgt_cluster + '_ldr_user01') | regex_replace('-', '_') }}"
+        ext_conn_name: "{{ (src_cluster + '_source') | regex_replace('-', '_') }}"
+        second_src_user: "{{ (tgt_cluster + '_ldr_user02') | regex_replace('-', '_') }}"
+        second_tgt_user: "{{ (src_cluster + '_ldr_user02') | regex_replace('-', '_') }}"
+
+    - name: Show summary of inputs
+      debug:
+        msg:
+          - "Source cluster: {{ src_cluster }}"
+          - "Target cluster: {{ tgt_cluster }}"
+          - "Nodes: {{ num_nodes }}"
+          - "CRDB version: {{ crdb_version }} ({{ crdb_major_minor }})"
+          - "Extend: {{ extend_choice }} {{ extend_val | default('') }}"
+          - "Mode: {{ ldr_mode }}"
+
+  tasks:
+    # ---------------------------
+    # Decide whether roachprod needs --secure when starting (as in your Bash)
+    # ---------------------------
+    - name: Get roachprod build tag (for start flag decision)
+      shell: |
+        set -o pipefail
+        roachprod version | awk -F': ' '/[Bb]uild tag/{print $2}' | awk '{print $1}' | cut -d- -f1
+      register: roachprod_build_tag
+      changed_when: false
+
+    - name: Compute SEC_FLAG from build tag (strict greater than v25.2.0)
+      set_fact:
+        roachprod_build_num: "{{ roachprod_build_tag.stdout | regex_replace('^v','') }}"
+        sec_flag: "{{ '--secure' if (roachprod_build_tag.stdout | regex_replace('^v','')) is version('25.2.0', '>') else '' }}"
+      when: roachprod_build_tag.stdout != ""
+
+    - debug:
+        msg:
+          - "build-tag = {{ roachprod_build_tag.stdout | default('unknown') }} → SEC_FLAG='{{ sec_flag | default('') }}'"
+
+    # ---------------------------
+    # AWS SSO login & cluster create/stage/start
+    # ---------------------------
+    - name: Discover AWS profile (same heuristic as Bash)
+      shell: |
+        set -o pipefail
+        egrep sso_account_id ~/.aws/config -B 3 | grep profile | awk '{print $2}' | sed -e 's|\]||g'
+      register: aws_profile
+      changed_when: false
+
+    - name: Login to AWS SSO
+      shell: "aws sso login --profile {{ aws_profile.stdout }}"
+      register: aws_login
+      changed_when: "'Success' in aws_login.stdout or aws_login.rc == 0"
+
+    - name: List existing roachprod clusters
+      shell: |
+        set -o pipefail
+        roachprod list | awk 'NR>1 {print $1}' | {{ roachprod_warn_filter }}
+      register: rp_clusters
+      changed_when: false
+
+    - name: Create source cluster if missing
+      shell: |
+        set -o pipefail
+        roachprod create -n {{ num_nodes }} {{ src_cluster }} --aws-profile {{ aws_profile.stdout }} | {{ roachprod_warn_filter }}
+      when: src_cluster not in rp_clusters.stdout_lines | default([])
+
+    - name: Stage CRDB release on source
+      shell: |
+        set -o pipefail
+        roachprod stage {{ src_cluster }} release {{ crdb_version }} | {{ roachprod_warn_filter }}
+
+    - name: Start source cluster
+      shell: |
+        set -o pipefail
+        roachprod start {{ src_cluster }} {{ sec_flag | default('') }} | {{ roachprod_warn_filter }}
+
+    - name: Create target cluster if missing
+      shell: |
+        set -o pipefail
+        roachprod create -n {{ num_nodes }} {{ tgt_cluster }} --aws-profile {{ aws_profile.stdout }} | {{ roachprod_warn_filter }}
+      when: tgt_cluster not in rp_clusters.stdout_lines | default([])
+
+    - name: Stage CRDB release on target
+      shell: |
+        set -o pipefail
+        roachprod stage {{ tgt_cluster }} release {{ crdb_version }} | {{ roachprod_warn_filter }}
+
+    - name: Start target cluster
+      shell: |
+        set -o pipefail
+        roachprod start {{ tgt_cluster }} {{ sec_flag | default('') }} | {{ roachprod_warn_filter }}
+
+    - name: Optionally extend cluster lifetime
+      shell: |
+        set -o pipefail
+        roachprod extend {{ item }} -l {{ extend_val }} | {{ roachprod_warn_filter }}
+      loop:
+        - "{{ src_cluster }}"
+        - "{{ tgt_cluster }}"
+      when: extend_choice | lower == 'yes' and extend_val | length > 0
+
+    - name: Get primary node IPs
+      shell: |
+        set -o pipefail
+        roachprod ip {{ item }} | head -n1 | {{ roachprod_warn_filter }}
+      register: rp_ips
+      loop:
+        - "{{ src_cluster }}"
+        - "{{ tgt_cluster }}"
+      changed_when: false
+
+    - set_fact:
+        src_ip: "{{ (rp_ips.results | selectattr('item','equalto', src_cluster) | first).stdout | trim }}"
+        tgt_ip: "{{ (rp_ips.results | selectattr('item','equalto', tgt_cluster) | first).stdout | trim }}"
+
+    - debug:
+        msg:
+          - "Source IP: {{ src_ip }}"
+          - "Target IP: {{ tgt_ip }}"
+
+    # ---------------------------
+    # Probe each cluster to learn secure vs insecure, then set flags accordingly
+    # ---------------------------
+    - name: Probe secure SQL on SOURCE
+      shell: >
+        roachprod run {{ src_cluster }}:1 "./cockroach sql --certs-dir=certs -e 'SELECT 1'"
+      register: src_sql_secure
+      changed_when: false
+      ignore_errors: true
+
+    - name: Probe insecure SQL on SOURCE (only if secure failed)
+      when: src_sql_secure.rc != 0
+      shell: >
+        roachprod run {{ src_cluster }}:1 "./cockroach sql --insecure -e 'SELECT 1'"
+      register: src_sql_insecure
+      changed_when: false
+      ignore_errors: true
+
+    - name: Decide SOURCE secure flag
+      set_fact:
+        src_secure: "{{ (src_sql_secure.rc | default(1)) == 0 }}"
+        src_auth_flag: "{{ '--certs-dir=certs' if (src_sql_secure.rc | default(1)) == 0 else '--insecure' }}"
+
+    - name: Fail if cannot connect to SOURCE either way
+      fail:
+        msg: "Cannot connect to SOURCE using either secure or insecure SQL."
+      when: (src_sql_secure.rc | default(1)) != 0 and (src_sql_insecure.rc | default(1)) != 0
+
+    - name: Probe secure SQL on TARGET
+      shell: >
+        roachprod run {{ tgt_cluster }}:1 "./cockroach sql --certs-dir=certs -e 'SELECT 1'"
+      register: tgt_sql_secure
+      changed_when: false
+      ignore_errors: true
+
+    - name: Probe insecure SQL on TARGET (only if secure failed)
+      when: tgt_sql_secure.rc != 0
+      shell: >
+        roachprod run {{ tgt_cluster }}:1 "./cockroach sql --insecure -e 'SELECT 1'"
+      register: tgt_sql_insecure
+      changed_when: false
+      ignore_errors: true
+
+    - name: Decide TARGET secure flag
+      set_fact:
+        tgt_secure: "{{ (tgt_sql_secure.rc | default(1)) == 0 }}"
+        tgt_auth_flag: "{{ '--certs-dir=certs' if (tgt_sql_secure.rc | default(1)) == 0 else '--insecure' }}"
+
+    - name: Fail if cannot connect to TARGET either way
+      fail:
+        msg: "Cannot connect to TARGET using either secure or insecure SQL."
+      when: (tgt_sql_secure.rc | default(1)) != 0 and (tgt_sql_insecure.rc | default(1)) != 0
+
+    # ---------------------------
+    # Unidirectional block — runs for BOTH (a) uni and (b) bidi
+    # ---------------------------
+    - block:
+        - name: Configure users/privileges and rangefeed on SOURCE
+          vars:
+            src_pw_clause: "{{ \"WITH PASSWORD 'a'\" if src_secure else '' }}"
+          shell: >
+            roachprod run {{ src_cluster }}:1
+            "./cockroach sql {{ src_auth_flag }} -e
+            \"SET CLUSTER SETTING kv.rangefeed.enabled = true;
+              CREATE USER {{ src_user }} {{ src_pw_clause }};
+              GRANT SYSTEM REPLICATION TO {{ src_user }};\""
+
+        - name: Configure user/privilege on TARGET
+          vars:
+            tgt_pw_clause: "{{ \"WITH PASSWORD 'a'\" if tgt_secure else '' }}"
+          shell: >
+            roachprod run {{ tgt_cluster }}:1
+            "./cockroach sql {{ tgt_auth_flag }} -e
+            \"CREATE USER {{ tgt_user }} {{ tgt_pw_clause }};
+              GRANT SYSTEM REPLICATION TO {{ tgt_user }};\""
+
+        - name: Ensure database exists on SOURCE and TARGET
+          shell: >
+            roachprod run {{ item }}:1 "./cockroach sql {{ (src_auth_flag if item == src_cluster else tgt_auth_flag) }} -e 'CREATE DATABASE IF NOT EXISTS {{ ldr_db }};'"
+          loop:
+            - "{{ src_cluster }}"
+            - "{{ tgt_cluster }}"
+
+        # ----- Build SOURCE external connection string (secure vs insecure) -----
+        - name: Build encoded SOURCE URI (secure only)
+          when: src_secure
+          shell: >
+            roachprod run {{ src_cluster }}:1
+            "./cockroach encode-uri postgres://{{ src_user }}:a@{{ src_ip }}:26257/
+            --ca-cert /home/ubuntu/certs/ca.crt --inline"
+          register: raw_source_uri
+
+        - name: Compute source_conn_str (secure)
+          when: src_secure
+          set_fact:
+            source_conn_str: >-
+              {{ raw_source_uri.stdout
+                 | regex_replace('/defaultdb','')
+                 | regex_replace('^postgres://','postgresql://')
+                 | trim }}
+
+        - name: Compute source_conn_str (insecure)
+          when: not src_secure
+          set_fact:
+            source_conn_str: "postgresql://{{ src_user }}@{{ src_ip }}:26257?sslmode=disable"
+
+        - name: Create EXTERNAL CONNECTION on TARGET
+          shell: >
+            roachprod run {{ tgt_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ tgt_auth_flag }} -e
+            \"CREATE EXTERNAL CONNECTION {{ ext_conn_name }} AS '{{ source_conn_str }}';\""
+
+        - name: Show EXTERNAL CONNECTIONS on TARGET (debug)
+          shell: >
+            roachprod run {{ tgt_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ tgt_auth_flag }} -e 'SHOW EXTERNAL CONNECTIONS;'"
+          register: show_ext
+          changed_when: false
+
+        - name: Stage workload binary on SOURCE
+          shell: "roachprod stage {{ src_cluster }} workload | {{ roachprod_warn_filter }}"
+
+        - name: Get PGURL for SOURCE (let roachprod include proper sslmode via SEC_FLAG as in Bash)
+          shell: "roachprod pgurl {{ src_cluster }} {{ sec_flag | default('') }}"
+          register: pgurl_src
+          changed_when: false
+
+        - name: Init workload (bank) on SOURCE
+          shell: >
+            roachprod run {{ src_cluster }}:1 --
+            "./cockroach workload init bank --db={{ ldr_db }} {{ pgurl_src.stdout }}"
+
+        - name: Run workload (bank) for 1m on SOURCE
+          shell: >
+            roachprod run {{ src_cluster }}:1 --
+            "./cockroach workload run bank --db={{ ldr_db }} --duration=1m '{{ pgurl_src.stdout }}'"
+
+        - name: Wait 60s for workload to settle
+          pause:
+            seconds: 60
+
+        - name: Verify tables created by workload on SOURCE
+          shell: >
+            roachprod run {{ src_cluster }}:1 "./cockroach sql {{ src_auth_flag }} -e \"USE {{ ldr_db }}; SHOW TABLES;\""
+          register: show_tables_src
+          changed_when: false
+
+        - name: Create empty bank table on TARGET (matches your DDL)
+          shell: >
+            roachprod run {{ tgt_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ tgt_auth_flag }} -e
+            \"USE {{ ldr_db }};
+              CREATE TABLE IF NOT EXISTS {{ ldr_table_fq }} (
+                id INT8 NOT NULL,
+                balance INT8 NULL,
+                payload STRING NULL,
+                CONSTRAINT bank_pkey PRIMARY KEY (id ASC),
+                FAMILY fam_0_id_balance_payload (id, balance, payload)
+              );\""
+
+        - name: Start LDR stream on TARGET (validated mode)
+          shell: >
+            roachprod run {{ tgt_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ tgt_auth_flag }} -e
+            \"CREATE LOGICAL REPLICATION STREAM
+               FROM TABLE {{ ldr_table_fq }}
+               ON 'external://{{ ext_conn_name }}'
+               INTO TABLE {{ ldr_table_fq }}
+               WITH MODE = validated;\""
+
+        - name: Show LDR jobs on TARGET
+          shell: >
+            roachprod run {{ tgt_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ tgt_auth_flag }} -e 'SHOW LOGICAL REPLICATION JOBS;'"
+          register: jobs_tgt
+          changed_when: false
+
+        - name: Count rows on SOURCE
+          shell: >
+            roachprod run {{ src_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ src_auth_flag }} --format=csv -e
+            'SELECT count(*) FROM {{ ldr_table_fq }};' | tail -n +2"
+          register: src_count
+          changed_when: false
+
+        - name: Wait 30s before counting TARGET
+          pause:
+            seconds: 30
+
+        - name: Count rows on TARGET
+          shell: >
+            roachprod run {{ tgt_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ tgt_auth_flag }} --format=csv -e
+            'SELECT count(*) FROM {{ ldr_table_fq }};' | tail -n +2"
+          register: tgt_count
+          changed_when: false
+
+        - name: Print counts (uni or pre-bidi)
+          debug:
+            msg:
+              - "Source rows: {{ src_count.stdout | trim }}"
+              - "Destination rows: {{ tgt_count.stdout | trim }}"
+      when: ldr_mode | lower is match('^a|^b')
+
+    # ---------------------------
+    # Bidirectional extension (runs only if mode starts with 'b')
+    # ---------------------------
+    - block:
+        - name: Configure users/privileges and rangefeed on SECOND SOURCE (== original TARGET)
+          vars:
+            second_src_pw_clause: "{{ \"WITH PASSWORD 'a'\" if tgt_secure else '' }}"
+          shell: >
+            roachprod run {{ tgt_cluster }}:1
+            "./cockroach sql {{ tgt_auth_flag }} -e
+            \"SET CLUSTER SETTING kv.rangefeed.enabled = true;
+              CREATE USER {{ second_src_user }} {{ second_src_pw_clause }};
+              GRANT SYSTEM REPLICATION TO {{ second_src_user }};\""
+
+        - name: Configure user/privilege on SECOND TARGET (== original SOURCE)
+          vars:
+            second_tgt_pw_clause: "{{ \"WITH PASSWORD 'a'\" if src_secure else '' }}"
+          shell: >
+            roachprod run {{ src_cluster }}:1
+            "./cockroach sql {{ src_auth_flag }} -e
+            \"CREATE USER {{ second_tgt_user }} {{ second_tgt_pw_clause }};
+              GRANT SYSTEM REPLICATION TO {{ second_tgt_user }};\""
+
+        # ----- Build reverse (SECOND SOURCE) external connection string -----
+        - name: Build encoded SECOND SOURCE URI (secure only)
+          when: tgt_secure
+          shell: >
+            roachprod run {{ tgt_cluster }}:1
+            "./cockroach encode-uri postgres://{{ second_src_user }}:a@{{ tgt_ip }}:26257/
+            --ca-cert /home/ubuntu/certs/ca.crt --inline"
+          register: raw_sec_source_uri
+
+        - name: Transform SECOND SOURCE URI (secure)
+          when: tgt_secure
+          set_fact:
+            sec_source_conn_str: >-
+              {{ raw_sec_source_uri.stdout
+                 | regex_replace('/defaultdb','')
+                 | regex_replace('^postgres://','postgresql://')
+                 | trim }}
+
+        - name: SECOND SOURCE URI (insecure)
+          when: not tgt_secure
+          set_fact:
+            sec_source_conn_str: "postgresql://{{ second_src_user }}@{{ tgt_ip }}:26257?sslmode=disable"
+
+        - name: Create SECOND EXTERNAL CONNECTION on original SOURCE
+          vars:
+            sec_ext_conn_name: "{{ (second_src_user + '_secondary_source') | regex_replace('-', '_') }}"
+          shell: >
+            roachprod run {{ src_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ src_auth_flag }} -e
+            \"CREATE EXTERNAL CONNECTION {{ sec_ext_conn_name }} AS '{{ sec_source_conn_str }}';\""
+
+        - name: Insert rows on SECOND SOURCE (== original TARGET)
+          shell: >
+            roachprod run {{ tgt_cluster }}:1
+            "./cockroach sql {{ tgt_auth_flag }} -e
+            \"USE {{ ldr_db }};
+              INSERT INTO {{ ldr_table_fq }} (id, balance, payload) VALUES
+              (1007, 4800, 'Seventh deposit'),
+              (1008, 5200, 'Eighth deposit');\""
+
+        - name: Wait 60s for replication
+          pause:
+            seconds: 60
+
+        - name: Start reverse LDR stream on original SOURCE
+          vars:
+            sec_ext_conn_name: "{{ (second_src_user + '_secondary_source') | regex_replace('-', '_') }}"
+          shell: >
+            roachprod run {{ src_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ src_auth_flag }} -e
+            \"CREATE LOGICAL REPLICATION STREAM
+               FROM TABLE {{ ldr_table_fq }}
+               ON 'external://{{ sec_ext_conn_name }}'
+               INTO TABLE {{ ldr_table_fq }}
+               WITH MODE = validated;\""
+
+        - name: Show LDR jobs on original SOURCE
+          shell: >
+            roachprod run {{ src_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ src_auth_flag }} -e 'SHOW LOGICAL REPLICATION JOBS;'"
+          register: jobs_src
+          changed_when: false
+
+        - name: Count rows after bidi (SECOND SRC == original TARGET)
+          shell: >
+            roachprod run {{ tgt_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ tgt_auth_flag }} --format=csv -e
+            'SELECT count(*) FROM {{ ldr_table_fq }};' | tail -n +2"
+          register: bidi_src_count
+          changed_when: false
+
+        - name: Count rows on other side (original SOURCE)
+          shell: >
+            roachprod run {{ src_cluster }}:1 -- bash -lc
+            "cd /mnt/data && ./cockroach sql {{ src_auth_flag }} --format=csv -e
+            'SELECT count(*) FROM {{ ldr_table_fq }};' | tail -n +2"
+          register: bidi_tgt_count
+          changed_when: false
+
+        - name: Print counts (bidi)
+          debug:
+            msg:
+              - "Bidi side A rows: {{ bidi_src_count.stdout | trim }}"
+              - "Bidi side B rows: {{ bidi_tgt_count.stdout | trim }}"
+      when: ldr_mode | lower is match('^b')
+
+  post_tasks:
+    - debug:
+        msg:
+          - "✅ LDR setup complete (mode: {{ 'bidirectional' if (ldr_mode | lower is match('^b')) else 'unidirectional' }})"
