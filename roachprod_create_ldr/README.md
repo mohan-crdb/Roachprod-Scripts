@@ -1,4 +1,4 @@
-# create-ldr-cluster-main.sh
+## Logical Data Replication (LDR)
 
 This script automates the provisioning of two CockroachDB clusters and sets up Logical Replication (LDR) between them—either unidirectional or bidirectional. It wraps `roachprod` commands to drop noisy warnings, validates input parameters, and guides you through each step.
 
@@ -9,94 +9,33 @@ This script automates the provisioning of two CockroachDB clusters and sets up L
 * AWS credentials/profiles set (uses `--aws-profile crl-revenue` by default).
 * `bash` shell with support for `set -euo pipefail`.
 
-## Features
+### Script
+- `roachprod_create_ldr/create-ldr-cluster-main.sh`
 
-* **Existence checks**: refuses to proceed if the source or target cluster names already exist in your `roachprod list`.
-* **Version validation**: enforces `v24.3.x`–style version input, rejects unsupported versions (< 24.3 or 25.x).
-* **Interactive prompts** for:
-  * Source/target cluster names (`<username>-<cluster>` format).
-  * Number of nodes per cluster.
-  * CockroachDB release version.
-  * Optional lifetime extension.
-  * Choice of unidirectional or bidirectional LDR.
+### What it supports
+- CockroachDB `v24.3.x`: Legacy LDR flow (`CREATE LOGICAL REPLICATION STREAM`)
+- CockroachDB `v25.x`: Automatic or Legacy flow, based on whether you test user-defined types (enums, etc.)
 
-* **Unidirectional & bidirectional** replication flows encapsulated in functions.
+### Defaults and input normalization
+- **Number of nodes**: empty input defaults to `1`
+- **CRDB version**: accepts `24.3.1` or `v24.3.1`; empty input defaults to `v24.3.1`
+- **Extend cluster lifetime**: empty input defaults to `no`
 
-## Usage
+### Automatic LDR behavior (v25.x, no user-defined types)
+- Uses `CREATE LOGICALLY REPLICATED TABLE` for automatic table creation and initial scan
+- Handles **bidirectional** setups by granting required privileges before creating the LDR stream
+- Uses root client certs for workload to avoid missing `~/.postgresql/postgresql.key` on nodes
 
-1. Make the script executable:
+### Prompts
+1. Source and target cluster names (`<username>-<cluster>`)
+2. Number of nodes (default `1`)
+3. CRDB version (default `v24.3.1`)
+4. UDT usage (for v25.x only):  
+   - **Yes** → Legacy flow (`CREATE LOGICAL REPLICATION STREAM`)  
+   - **No** → Automatic flow (`CREATE LOGICALLY REPLICATED TABLE`)
+5. Extend cluster lifetime (default `no`)
 
-   ```bash
-   chmod +x create-ldr-cluster-main.sh
-   ```
-
-2. Run it:
-
-   ```bash
-   ./create-ldr-cluster-main.sh
-   ```
-
-3. Follow the prompts:
-
-   ```text
-   --------------------------------------
-   Enter Cluster Details:
-   --------------------------------------
-   Enter source cluster name (format <username>-<cluster>): mohan-01
-   Enter target cluster name (format <username>-<cluster>): mohan-02
-   Validating mohan-01 and mohan-02 cluster names, please wait..
-   ✅ All Good
-
-   Enter number of nodes (>=1): 3
-   Enter CRDB version (format v24.3.x): v24.3.9
-   Extend cluster lifetime? (yes/no): no
-   --------------------------------------
-   🚀 Creating clusters...
-   --------------------------------------
-   ✅ Clusters ready:
-      - mohan-01 IP: 10.142.0.17
-      - mohan-02 IP: 10.142.0.35
-   --------------------------------------
-   Choose LDR mode: (a) unidirectional or (b) bidirectional): a
-   ... (rest of steps)
-   ```
-
-## Configuration
-
-* **AWS profile**: change `--aws-profile crl-revenue` in the cluster creation section if needed.
-* **Certificate directory**: the script assumes `certs/` is mounted at `/home/ubuntu/certs`; adjust paths in `run_roach` commands if your setup differs.
-
-## Functions
-
-* `run_roach`: wraps `roachprod` and filters warnings.
-* `cluster_exists`: checks for existing clusters via `roachprod list`.
-* `run_unidirectional`: sets up unidirectional LDR from source to target.
-* `run_bidirectional`: runs uni‑directional then reverses direction to complete bidirectional LDR.
-
-## Error Handling
-
-* **Cluster name mismatch**: script exits if the `<username>` part doesn’t match your `$CLUSTER` env var.
-* **Existing clusters**: aborts if either name already appears in `roachprod list`.
-* **Version format**: rejects any input not matching `v<major>.<minor>.<patch>`.
-* **Unsupported versions**: blocks `< v24.3` and any `v25.x` releases.
-
-## Troubleshooting
-
-* **Prompts not accepting input**: ensure there is no global `exec 2>…` redirection above; the current version uses a `run_roach` wrapper instead.
-* **Permission errors**: verify AWS credentials and certificate paths.
-* **Networking issues**: check that the EC2 instances for each cluster can communicate on port 26257.
-
-## Contributing
-
-Feel free to submit issues or pull requests to:
-
-* Add support for custom AWS regions/profiles.
-* Parameterize certificate paths.
-* Implement non‑interactive mode via CLI flags.
-
-## References:
-LDR for 24.3.x:https://www.cockroachlabs.com/docs/v24.3/set-up-logical-data-replication 
----
-
-*Generated by create-ldr-cluster-main.sh README template*
-
+### Example
+```bash
+./roachprod_create_ldr/create-ldr-cluster-main.sh
+```
