@@ -24,6 +24,7 @@ prefix_exists() {
     | awk 'NR>1 {print $1}' \
     | grep -Eiq "^${prefix}(-|$)"
 }
+
 # ----------------------------------------
 # Detect roachprod build tag and set secure flag threshold at v25.2.0
 # ----------------------------------------
@@ -33,16 +34,13 @@ ROACHPROD_BUILD_TAG=$(roachprod version 2>&1 \
   | xargs \
   | cut -d- -f1)
 
-# 2) strip leading “v” and split into numbers:
 bt="${ROACHPROD_BUILD_TAG#v}"
 IFS=. read -r maj min pat <<< "$bt"
 
-# 3) threshold components:
 req_maj=25
 req_min=2
 req_pat=0
 
-# 4) strict “greater than” logic → only newer than 25.2.0:
 if (( maj > req_maj )) \
    || (( maj == req_maj && min > req_min )) \
    || (( maj == req_maj && min == req_min && pat > req_pat )); then
@@ -52,18 +50,19 @@ else
 fi
 
 echo "build-tag = $ROACHPROD_BUILD_TAG → SEC_FLAG='$SEC_FLAG'"
+
 # ----------------------------------------
 # FUNCTION: Unidirectional replication
 # ----------------------------------------
 run_unidirectional() {
 
-echo "--------------------------------------"
+  echo "--------------------------------------"
   SRC_USER=$(echo "${SRC_CLUSTER}_ldr_user01" | tr '-' '_')
   TGT_USER=$(echo "${TGT_CLUSTER}_ldr_user01" | tr '-' '_')
   EXT_CONN_NAME=$(echo "${SRC_CLUSTER}_source" | tr '-' '_')
-echo "--------------------------------------"
+  echo "--------------------------------------"
   echo "🔧 Configuring users and privileges..."
-echo "--------------------------------------"
+  echo "--------------------------------------"
   run_roach run "$SRC_CLUSTER:1" "./cockroach sql --certs-dir=certs -e \"
 SET CLUSTER SETTING kv.rangefeed.enabled = true;
 CREATE USER $SRC_USER WITH PASSWORD 'a';
@@ -85,105 +84,97 @@ GRANT SYSTEM REPLICATION TO $TGT_USER;
       "./cockroach encode-uri postgres://${SRC_CLUSTER}_ldr_user01:a@${SRC_IP}:26257/ \
         --ca-cert /home/ubuntu/certs/ca.crt --inline"
   )
-echo "--------------------------------------"
+
+  echo "--------------------------------------"
   echo "Encode-uri output:"
-echo "--------------------------------------"
+  echo "--------------------------------------"
   echo "$SOURCE_URI"
 
   URI_NO_DB="${SOURCE_URI/\/defaultdb/}"
- # echo "$URI_NO_DB"
 
-  CONN_STR=$(printf '%s' "$URI_NO_DB" | \
-    sed 's@^postgres://@postgresql://@')
-
+  CONN_STR=$(printf '%s' "$URI_NO_DB" | sed 's@^postgres://@postgresql://@')
   OLD_USER="${SRC_CLUSTER}_ldr_user01"
   CONN_STR="${CONN_STR/$OLD_USER/$SRC_USER}"
-echo "--------------------------------------"
+
+  echo "--------------------------------------"
   echo "🔄 Updated connection string with correct user: $CONN_STR"
-echo "--------------------------------------"
-echo "Creating EXTERNAL CONNECTION:"
-echo "--------------------------------------"
+  echo "--------------------------------------"
+  echo "Creating EXTERNAL CONNECTION:"
+  echo "--------------------------------------"
   run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && \
-    ./cockroach sql --certs-dir=certs -e \
-    \"CREATE EXTERNAL CONNECTION $EXT_CONN_NAME AS '$CONN_STR';\""
-echo "--------------------------------------"
+    ./cockroach sql --certs-dir=certs -e 'CREATE EXTERNAL CONNECTION ${EXT_CONN_NAME} AS \"${CONN_STR}\";'"
+
+  echo "--------------------------------------"
   echo "🔍 Verifying external connections on $TGT_CLUSTER:1"
-echo "--------------------------------------"
-  run_roach run "$TGT_CLUSTER:1" -- \
-    bash -c 'cd /mnt/data; \
-      ./cockroach sql --certs-dir=certs -e "SHOW EXTERNAL CONNECTIONS;"'
-echo "--------------------------------------"
+  echo "--------------------------------------"
+  run_roach run "$TGT_CLUSTER:1" -- bash -c 'cd /mnt/data; ./cockroach sql --certs-dir=certs -e "SHOW EXTERNAL CONNECTIONS;"'
+
+  echo "--------------------------------------"
   echo "📦 Staging workload binary on $SRC_CLUSTER"
-echo "--------------------------------------"
+  echo "--------------------------------------"
   run_roach stage "$SRC_CLUSTER" workload
 
-echo "🚦 Running bank workload for 1m"
-PGURL=$(run_roach pgurl "$SRC_CLUSTER" $SEC_FLAG)
-run_roach run "$SRC_CLUSTER:1" $SEC_FLAG -- \
-  "./cockroach workload init bank --db=ldr_db $PGURL" &
-sleep 10
-run_roach run "$SRC_CLUSTER:1" $SEC_FLAG -- \
-  "./cockroach workload run bank --db=ldr_db --duration=1m '$PGURL'" &
+  echo "🚦 Running bank workload for 1m"
+  # Use root client certs to avoid missing ~/.postgresql client key errors
+  PGURL="postgresql://root@${SRC_IP}:26257/ldr_db?sslmode=verify-full&sslrootcert=/home/ubuntu/certs/ca.crt&sslcert=/home/ubuntu/certs/client.root.crt&sslkey=/home/ubuntu/certs/client.root.key"
+  run_roach run "$SRC_CLUSTER:1" $SEC_FLAG -- \
+    "./cockroach workload init bank --db=ldr_db \"$PGURL\"" &
+  sleep 10
+  run_roach run "$SRC_CLUSTER:1" $SEC_FLAG -- \
+    "./cockroach workload run bank --db=ldr_db --duration=1m \"$PGURL\"" &
 
-echo "⏳ Waiting 60s for workload to complete..."
-sleep 60
+  echo "⏳ Waiting 60s for workload to complete..."
+  sleep 60
 
-echo "--------------------------------------"
+  echo "--------------------------------------"
   echo "🔍 Verifying tables created by workload on $SRC_CLUSTER"
-echo "--------------------------------------"
-  run_roach run "${SRC_CLUSTER}:1"  -- \
-    "./cockroach sql --certs-dir=certs -e \"USE ldr_db; SHOW TABLES;\""
+  echo "--------------------------------------"
+  run_roach run "${SRC_CLUSTER}:1"  -- "./cockroach sql --certs-dir=certs -e \"USE ldr_db; SHOW TABLES;\""
 
-echo "--------------------------------------"
+  echo "--------------------------------------"
   echo "✏️  Creating empty bank table on destination ($TGT_CLUSTER)"
-echo "--------------------------------------"
+  echo "--------------------------------------"
   run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && \
-    ./cockroach sql --certs-dir=certs -e \"USE ldr_db; \
-      CREATE TABLE IF NOT EXISTS $Unidirectional_LDR_DB.public.bank ( \
+    ./cockroach sql --certs-dir=certs -e 'USE ldr_db; \
+      CREATE TABLE IF NOT EXISTS ${Unidirectional_LDR_DB}.public.bank ( \
         id INT8 NOT NULL, \
         balance INT8 NULL, \
         payload STRING NULL, \
-        CONSTRAINT bank_pkey PRIMARY KEY (id ASC), \
-        FAMILY fam_0_id_balance_payload (id, balance, payload) \
-      );\""
-echo "--------------------------------------"
+        CONSTRAINT bank_pkey PRIMARY KEY (id ASC));'"
+
+  echo "--------------------------------------"
   echo "➡️  Starting LDR stream on destination ($TGT_CLUSTER)"
-echo "--------------------------------------"
+  echo "--------------------------------------"
   run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && \
-    ./cockroach sql --certs-dir=certs -e \
-    \"CREATE LOGICAL REPLICATION STREAM \
-      FROM TABLE $Unidirectional_LDR_DB.public.bank \
-      ON 'external://$EXT_CONN_NAME' \
-      INTO TABLE $Unidirectional_LDR_DB.public.bank \
-      WITH MODE = validated;\""
-echo "--------------------------------------"
+    ./cockroach sql --certs-dir=certs -e 'CREATE LOGICAL REPLICATION STREAM \
+      FROM TABLE ${Unidirectional_LDR_DB}.public.bank \
+      ON \"external://${EXT_CONN_NAME}\" \
+      INTO TABLE ${Unidirectional_LDR_DB}.public.bank \
+      WITH MODE = validated;'"
+
+  echo "--------------------------------------"
   echo "📊  Monitoring LDR jobs on destination ($TGT_CLUSTER)"
-echo "--------------------------------------"
-  run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && \
-    ./cockroach sql --certs-dir=certs -e \"SHOW LOGICAL REPLICATION JOBS;\""
-echo "--------------------------------------"
+  echo "--------------------------------------"
+  run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && ./cockroach sql --certs-dir=certs -e 'SHOW LOGICAL REPLICATION JOBS;'"
+
+  echo "--------------------------------------"
   echo "🔢  Verifying row counts on source and destination"
-echo "--------------------------------------"
-  SRC_COUNT=$(run_roach run "$SRC_CLUSTER:1" -- bash -lc "cd /mnt/data && \
-    ./cockroach sql --certs-dir=certs --format=csv -e \
-      \"SELECT count(*) FROM $Unidirectional_LDR_DB.public.bank;\"" | tail -n +2)
-  sleep 30;
-  TGT_COUNT=$(run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && \
-    ./cockroach sql --certs-dir=certs --format=csv -e \
-      \"SELECT count(*) FROM $Unidirectional_LDR_DB.public.bank;\"" | tail -n +2)
+  echo "--------------------------------------"
+  SRC_COUNT=$(run_roach run "$SRC_CLUSTER:1" -- bash -lc "cd /mnt/data && ./cockroach sql --certs-dir=certs --format=csv -e 'SELECT count(*) FROM ${Unidirectional_LDR_DB}.public.bank;'" | tail -n +2)
+  sleep 30
+  TGT_COUNT=$(run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && ./cockroach sql --certs-dir=certs --format=csv -e 'SELECT count(*) FROM ${Unidirectional_LDR_DB}.public.bank;'" | tail -n +2)
 
   echo "Source rows:      $SRC_COUNT"
   echo "Destination rows: $TGT_COUNT"
-echo "--------------------------------------"
-echo "✅ Unidirectional LDR setup complete"
+  echo "--------------------------------------"
+  echo "✅ Unidirectional LDR setup complete"
 }
 
 # ----------------------------------------
 # FUNCTION: Bidirectional replication
 # ----------------------------------------
 run_bidirectional() {
-
-  # First do the uni-directional half
+    # First do the uni-directional half
   run_unidirectional
 
 echo "--------------------------------------"
@@ -280,6 +271,340 @@ echo "--------------------------------------"
 }
 
 # ----------------------------------------
+# FUNCTION: Legacy LDR setup wrapper
+# ----------------------------------------
+run_legacy_ldr_setup() {
+  echo "🚀 Running Legacy LDR setup flow for $CRDB_VERSION..."
+  echo "--------------------------------------"
+  read -p "Choose LDR mode: (a) unidirectional or (b) bidirectional): " LDR_MODE
+  lc_mode=$(echo "$LDR_MODE" | tr '[:upper:]' '[:lower:]')
+  case "$lc_mode" in
+    a*) run_unidirectional ;;
+    b*) echo "🔄 Running bidirectional LDR..."; run_bidirectional ;;
+    *) echo "❌ Invalid LDR mode"; exit 1 ;;
+  esac
+}
+
+# ----------------------------------------
+# FUNCTION: Automatic Unidirectional replication (CREATE LOGICALLY REPLICATED TABLE)
+# ----------------------------------------
+run_auto_unidirectional() {
+  echo "--------------------------------------"
+  echo "🚀 Running Automatic Unidirectional LDR (CREATE LOGICALLY REPLICATED TABLE)"
+  echo "--------------------------------------"
+  
+  SRC_USER=$(echo "${SRC_CLUSTER}_ldr_user01" | tr '-' '_')
+  TGT_USER=$(echo "${TGT_CLUSTER}_ldr_user01" | tr '-' '_')
+  EXT_CONN_NAME=$(echo "${SRC_CLUSTER}_source" | tr '-' '_')
+  
+  echo "--------------------------------------"
+  echo "🔧 Configuring users and privileges..."
+  echo "--------------------------------------"
+  # For CREATE LOGICALLY REPLICATED TABLE, we need admin or REPLICATION system privilege
+  run_roach run "$SRC_CLUSTER:1" "./cockroach sql --certs-dir=certs -e \"
+SET CLUSTER SETTING kv.rangefeed.enabled = true;
+CREATE USER IF NOT EXISTS $SRC_USER WITH PASSWORD 'a';
+GRANT SYSTEM REPLICATION TO $SRC_USER;
+\""
+
+  run_roach run "$TGT_CLUSTER:1" "./cockroach sql --certs-dir=certs -e \"
+CREATE USER IF NOT EXISTS $TGT_USER WITH PASSWORD 'a';
+GRANT SYSTEM REPLICATION TO $TGT_USER;
+\""
+
+  # Create database on both clusters (table will be created automatically on destination)
+  run_roach run "$SRC_CLUSTER:1" "./cockroach sql --certs-dir=certs -e 'CREATE DATABASE IF NOT EXISTS ldr_db;'"
+  run_roach run "$TGT_CLUSTER:1" "./cockroach sql --certs-dir=certs -e 'CREATE DATABASE IF NOT EXISTS ldr_db;'"
+  
+  AUTO_LDR_DB='ldr_db'
+
+  echo "--------------------------------------"
+  echo "🔗 Creating external connection..."
+  echo "--------------------------------------"
+  SOURCE_URI=$(
+    run_roach run "${SRC_CLUSTER}:1" \
+      "./cockroach encode-uri postgres://${SRC_USER}:a@${SRC_IP}:26257/ \
+        --ca-cert /home/ubuntu/certs/ca.crt --inline"
+  )
+
+  echo "--------------------------------------"
+  echo "Encode-uri output:"
+  echo "--------------------------------------"
+  echo "$SOURCE_URI"
+
+  URI_NO_DB="${SOURCE_URI/\/defaultdb/}"
+  CONN_STR=$(printf '%s' "$URI_NO_DB" | sed 's@^postgres://@postgresql://@')
+  
+  echo "--------------------------------------"
+  echo "🔄 Connection string: $CONN_STR"
+  echo "--------------------------------------"
+  
+  echo "Creating EXTERNAL CONNECTION on destination:"
+  echo "--------------------------------------"
+  run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && \
+    ./cockroach sql --certs-dir=certs -e 'CREATE EXTERNAL CONNECTION IF NOT EXISTS ${EXT_CONN_NAME} AS \"${CONN_STR}\";'"
+
+  echo "--------------------------------------"
+  echo "🔍 Verifying external connections on $TGT_CLUSTER:1"
+  echo "--------------------------------------"
+  run_roach run "$TGT_CLUSTER:1" -- bash -c 'cd /mnt/data; ./cockroach sql --certs-dir=certs -e "SHOW EXTERNAL CONNECTIONS;"'
+
+  echo "--------------------------------------"
+  echo "📦 Staging workload binary on $SRC_CLUSTER"
+  echo "--------------------------------------"
+  run_roach stage "$SRC_CLUSTER" workload
+
+  echo "🚦 Running bank workload for 1m"
+  # Use root client certs to avoid missing ~/.postgresql client key errors
+  PGURL="postgresql://root@${SRC_IP}:26257/ldr_db?sslmode=verify-full&sslrootcert=/home/ubuntu/certs/ca.crt&sslcert=/home/ubuntu/certs/client.root.crt&sslkey=/home/ubuntu/certs/client.root.key"
+  run_roach run "$SRC_CLUSTER:1" $SEC_FLAG -- \
+    "./cockroach workload init bank --db=ldr_db \"$PGURL\"" &
+  sleep 10
+  run_roach run "$SRC_CLUSTER:1" $SEC_FLAG -- \
+    "./cockroach workload run bank --db=ldr_db --duration=1m \"$PGURL\"" &
+
+  echo "⏳ Waiting 60s for workload to complete..."
+  sleep 60
+
+  echo "--------------------------------------"
+  echo "🔍 Verifying tables created by workload on $SRC_CLUSTER"
+  echo "--------------------------------------"
+  run_roach run "${SRC_CLUSTER}:1" -- "./cockroach sql --certs-dir=certs -e \"USE ldr_db; SHOW TABLES;\""
+
+  echo "--------------------------------------"
+  echo "➡️  Starting automatic LDR with CREATE LOGICALLY REPLICATED TABLE"
+  echo "    (Table will be created automatically on destination)"
+  echo "--------------------------------------"
+  run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && \
+    ./cockroach sql --certs-dir=certs -e 'CREATE LOGICALLY REPLICATED TABLE ${AUTO_LDR_DB}.public.bank \
+      FROM TABLE ${AUTO_LDR_DB}.public.bank \
+      ON \"external://${EXT_CONN_NAME}\" \
+      WITH unidirectional;'"
+
+  echo "--------------------------------------"
+  echo "📊  Monitoring LDR jobs on destination ($TGT_CLUSTER)"
+  echo "--------------------------------------"
+  run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && ./cockroach sql --certs-dir=certs -e 'SHOW LOGICAL REPLICATION JOBS;'"
+
+  echo "--------------------------------------"
+  echo "⏳ Waiting for initial scan to complete (30s)..."
+  echo "--------------------------------------"
+  sleep 30
+
+  echo "--------------------------------------"
+  echo "🔢  Verifying row counts on source and destination"
+  echo "--------------------------------------"
+  SRC_COUNT=$(run_roach run "$SRC_CLUSTER:1" -- bash -lc "cd /mnt/data && ./cockroach sql --certs-dir=certs --format=csv -e 'SELECT count(*) FROM ${AUTO_LDR_DB}.public.bank;'" | tail -n +2)
+  sleep 30
+  TGT_COUNT=$(run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && ./cockroach sql --certs-dir=certs --format=csv -e 'SELECT count(*) FROM ${AUTO_LDR_DB}.public.bank;'" | tail -n +2)
+
+  echo "Source rows:      $SRC_COUNT"
+  echo "Destination rows:   $TGT_COUNT"
+  echo "--------------------------------------"
+  echo "✅ Automatic Unidirectional LDR setup complete"
+}
+
+# ----------------------------------------
+# FUNCTION: Automatic Bidirectional replication (CREATE LOGICALLY REPLICATED TABLE)
+# ----------------------------------------
+run_auto_bidirectional() {
+  echo "--------------------------------------"
+  echo "🚀 Running Automatic Bidirectional LDR (CREATE LOGICALLY REPLICATED TABLE)"
+  echo "--------------------------------------"
+  
+  SRC_USER=$(echo "${SRC_CLUSTER}_ldr_user01" | tr '-' '_')
+  TGT_USER=$(echo "${TGT_CLUSTER}_ldr_user01" | tr '-' '_')
+  EXT_CONN_SRC_NAME=$(echo "${SRC_CLUSTER}_source" | tr '-' '_')
+  EXT_CONN_TGT_NAME=$(echo "${TGT_CLUSTER}_destination" | tr '-' '_')
+  
+  echo "--------------------------------------"
+  echo "🔧 Configuring users and privileges..."
+  echo "--------------------------------------"
+  run_roach run "$SRC_CLUSTER:1" "./cockroach sql --certs-dir=certs -e \"
+SET CLUSTER SETTING kv.rangefeed.enabled = true;
+CREATE USER IF NOT EXISTS $SRC_USER WITH PASSWORD 'a';
+GRANT SYSTEM REPLICATION TO $SRC_USER;
+\""
+
+  run_roach run "$TGT_CLUSTER:1" "./cockroach sql --certs-dir=certs -e \"
+SET CLUSTER SETTING kv.rangefeed.enabled = true;
+CREATE USER IF NOT EXISTS $TGT_USER WITH PASSWORD 'a';
+GRANT SYSTEM REPLICATION TO $TGT_USER;
+\""
+
+  # Create database on both clusters (table will be created automatically on destination)
+  run_roach run "$SRC_CLUSTER:1" "./cockroach sql --certs-dir=certs -e 'CREATE DATABASE IF NOT EXISTS ldr_db;'"
+  run_roach run "$TGT_CLUSTER:1" "./cockroach sql --certs-dir=certs -e 'CREATE DATABASE IF NOT EXISTS ldr_db;'"
+  
+  AUTO_LDR_DB='ldr_db'
+
+  echo "--------------------------------------"
+  echo "🔗 Creating external connections..."
+  echo "--------------------------------------"
+  
+  # Connection from destination to source
+  SOURCE_URI=$(
+    run_roach run "${SRC_CLUSTER}:1" \
+      "./cockroach encode-uri postgres://${SRC_USER}:a@${SRC_IP}:26257/ \
+        --ca-cert /home/ubuntu/certs/ca.crt --inline"
+  )
+  URI_NO_DB="${SOURCE_URI/\/defaultdb/}"
+  CONN_STR_SRC=$(printf '%s' "$URI_NO_DB" | sed 's@^postgres://@postgresql://@')
+  
+  # Connection from source to destination (for bidirectional)
+  TGT_URI=$(
+    run_roach run "${TGT_CLUSTER}:1" \
+      "./cockroach encode-uri postgres://${TGT_USER}:a@${TGT_IP}:26257/ \
+        --ca-cert /home/ubuntu/certs/ca.crt --inline"
+  )
+  URI_NO_DB_TGT="${TGT_URI/\/defaultdb/}"
+  CONN_STR_TGT=$(printf '%s' "$URI_NO_DB_TGT" | sed 's@^postgres://@postgresql://@')
+  
+  echo "--------------------------------------"
+  echo "Creating EXTERNAL CONNECTION on destination (to source):"
+  echo "--------------------------------------"
+  run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && \
+    ./cockroach sql --certs-dir=certs -e 'CREATE EXTERNAL CONNECTION IF NOT EXISTS ${EXT_CONN_SRC_NAME} AS \"${CONN_STR_SRC}\";'"
+
+  echo "--------------------------------------"
+  echo "Creating EXTERNAL CONNECTION on source (to destination):"
+  echo "--------------------------------------"
+  run_roach run "$SRC_CLUSTER:1" -- bash -lc "cd /mnt/data && \
+    ./cockroach sql --certs-dir=certs -e 'CREATE EXTERNAL CONNECTION IF NOT EXISTS ${EXT_CONN_TGT_NAME} AS \"${CONN_STR_TGT}\";'"
+
+  echo "--------------------------------------"
+  echo "🔍 Verifying external connections"
+  echo "--------------------------------------"
+  run_roach run "$TGT_CLUSTER:1" -- bash -c 'cd /mnt/data; ./cockroach sql --certs-dir=certs -e "SHOW EXTERNAL CONNECTIONS;"'
+  run_roach run "$SRC_CLUSTER:1" -- bash -c 'cd /mnt/data; ./cockroach sql --certs-dir=certs -e "SHOW EXTERNAL CONNECTIONS;"'
+
+  echo "--------------------------------------"
+  echo "📦 Staging workload binary on $SRC_CLUSTER"
+  echo "--------------------------------------"
+  run_roach stage "$SRC_CLUSTER" workload
+
+  echo "🚦 Running bank workload for 1m"
+  PGURL=$(run_roach pgurl "$SRC_CLUSTER" $SEC_FLAG)
+  run_roach run "$SRC_CLUSTER:1" $SEC_FLAG -- \
+    "./cockroach workload init bank --db=ldr_db $PGURL" &
+  sleep 10
+  run_roach run "$SRC_CLUSTER:1" $SEC_FLAG -- \
+    "./cockroach workload run bank --db=ldr_db --duration=1m '$PGURL'" &
+
+  echo "⏳ Waiting 60s for workload to complete..."
+  sleep 60
+
+  echo "--------------------------------------"
+  echo "🔍 Verifying tables created by workload on $SRC_CLUSTER"
+  echo "--------------------------------------"
+  run_roach run "${SRC_CLUSTER}:1" -- "./cockroach sql --certs-dir=certs -e \"USE ldr_db; SHOW TABLES;\""
+
+  echo "--------------------------------------"
+  echo "🔐 Granting privileges for bidirectional replication"
+  echo "--------------------------------------"
+  # Grant CREATE privilege on destination database (required for CREATE LOGICALLY REPLICATED TABLE)
+  echo "Granting CREATE privilege on destination database..."
+  run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && \
+    ./cockroach sql --certs-dir=certs -e 'GRANT CREATE ON DATABASE ${AUTO_LDR_DB} TO ${TGT_USER};'"
+  
+  # Grant SYSTEM REPLICATIONDEST privilege to both users for bidirectional replication
+  echo "Granting SYSTEM REPLICATIONDEST to both users..."
+  run_roach run "$SRC_CLUSTER:1" -- bash -lc "cd /mnt/data && \
+    ./cockroach sql --certs-dir=certs -e 'GRANT SYSTEM REPLICATIONDEST TO ${SRC_USER};'"
+  
+  run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && \
+    ./cockroach sql --certs-dir=certs -e 'GRANT SYSTEM REPLICATIONDEST TO ${TGT_USER};'"
+  
+  # Grant table-level REPLICATIONDEST on the source table to the source user
+  # This is required because when bidirectional stream is set up, the source cluster acts as destination
+  echo "Granting REPLICATIONDEST on source table to source user..."
+  run_roach run "$SRC_CLUSTER:1" -- bash -lc "cd /mnt/data && \
+    ./cockroach sql --certs-dir=certs -e 'GRANT REPLICATIONDEST ON TABLE ${AUTO_LDR_DB}.public.bank TO ${SRC_USER};'"
+  
+  echo "Verifying privileges were granted..."
+  run_roach run "$SRC_CLUSTER:1" -- bash -lc "cd /mnt/data && \
+    ./cockroach sql --certs-dir=certs --format=csv -e 'SHOW GRANTS ON TABLE ${AUTO_LDR_DB}.public.bank FOR ${SRC_USER};' \
+    | grep -q 'REPLICATIONDEST'" \
+    || { echo '❌ Missing REPLICATIONDEST on source table for ${SRC_USER}'; exit 1; }
+  
+  echo "Verifying SYSTEM privileges..."
+  run_roach run "$SRC_CLUSTER:1" -- bash -lc "cd /mnt/data && \
+    ./cockroach sql --certs-dir=certs --format=csv -e 'SHOW GRANTS ON SYSTEM FOR ${SRC_USER};' \
+    | grep -q 'REPLICATIONDEST'" \
+    || { echo '❌ Missing SYSTEM REPLICATIONDEST for ${SRC_USER}'; exit 1; }
+  
+  echo "⏳ Waiting 2s for privileges to be fully committed..."
+  sleep 2
+
+  echo "--------------------------------------"
+  echo "➡️  Starting automatic bidirectional LDR with CREATE LOGICALLY REPLICATED TABLE"
+  echo "    (Table will be created automatically on destination, then reverse stream initialized)"
+  echo "--------------------------------------"
+  # Run from destination cluster (the one that doesn't have the table)
+  run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && \
+    ./cockroach sql --certs-dir=certs -e 'CREATE LOGICALLY REPLICATED TABLE ${AUTO_LDR_DB}.public.bank \
+      FROM TABLE ${AUTO_LDR_DB}.public.bank \
+      ON \"external://${EXT_CONN_SRC_NAME}\" \
+      WITH bidirectional ON \"external://${EXT_CONN_TGT_NAME}\";'"
+
+  echo "--------------------------------------"
+  echo "📊  Monitoring LDR jobs on both clusters"
+  echo "--------------------------------------"
+  echo "Jobs on destination ($TGT_CLUSTER):"
+  run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && ./cockroach sql --certs-dir=certs -e 'SHOW LOGICAL REPLICATION JOBS;'"
+  echo ""
+  echo "Jobs on source ($SRC_CLUSTER):"
+  run_roach run "$SRC_CLUSTER:1" -- bash -lc "cd /mnt/data && ./cockroach sql --certs-dir=certs -e 'SHOW LOGICAL REPLICATION JOBS;'"
+
+  echo "--------------------------------------"
+  echo "⏳ Waiting for initial scan to complete (60s)..."
+  echo "--------------------------------------"
+  sleep 60
+
+  echo "--------------------------------------"
+  echo "📝 Writing test data to destination cluster"
+  echo "--------------------------------------"
+  run_roach run "$TGT_CLUSTER:1" "./cockroach sql --certs-dir=certs -e \"
+USE ldr_db;
+INSERT INTO ${AUTO_LDR_DB}.public.bank (id, balance, payload)
+VALUES 
+  (1007, 4800, 'Seventh deposit'),
+  (1008, 5200, 'Eighth deposit');\""
+
+  echo "--------------------------------------"
+  echo "⏳ Waiting for bidirectional replication (30s)..."
+  echo "--------------------------------------"
+  sleep 30
+
+  echo "--------------------------------------"
+  echo "🔢  Verifying row counts on source and destination"
+  echo "--------------------------------------"
+  SRC_COUNT=$(run_roach run "$SRC_CLUSTER:1" -- bash -lc "cd /mnt/data && ./cockroach sql --certs-dir=certs --format=csv -e 'SELECT count(*) FROM ${AUTO_LDR_DB}.public.bank;'" | tail -n +2)
+  TGT_COUNT=$(run_roach run "$TGT_CLUSTER:1" -- bash -lc "cd /mnt/data && ./cockroach sql --certs-dir=certs --format=csv -e 'SELECT count(*) FROM ${AUTO_LDR_DB}.public.bank;'" | tail -n +2)
+
+  echo "Source rows:      $SRC_COUNT"
+  echo "Destination rows: $TGT_COUNT"
+  echo "--------------------------------------"
+  echo "✅ Automatic Bidirectional LDR setup complete"
+}
+
+# ----------------------------------------
+# FUNCTION: Automatic LDR setup wrapper
+# ----------------------------------------
+run_auto_ldr_setup() {
+  echo "🚀 Running Automatic LDR setup flow for $CRDB_VERSION..."
+  echo "Using CREATE LOGICALLY REPLICATED TABLE (automatic table creation and initial scan)"
+  echo "--------------------------------------"
+  read -p "Choose LDR mode: (a) unidirectional or (b) bidirectional): " LDR_MODE
+  lc_mode=$(echo "$LDR_MODE" | tr '[:upper:]' '[:lower:]')
+  case "$lc_mode" in
+    a*) run_auto_unidirectional ;;
+    b*) echo "🔄 Running automatic bidirectional LDR..."; run_auto_bidirectional ;;
+    *) echo "❌ Invalid LDR mode"; exit 1 ;;
+  esac
+}
+
+# ----------------------------------------
 # MAIN EXECUTION LOGIC
 # ----------------------------------------
 echo "--------------------------------------"
@@ -294,42 +619,72 @@ if [[ "$SRC_CLUSTER" == "$TGT_CLUSTER" ]]; then
   exit 1
 fi
 
-read -p "Enter number of nodes (>=1): " NUM_NODES
+read -p "Enter number of nodes (>=1, default 1): " NUM_NODES
+if [[ -z "$NUM_NODES" ]]; then
+  NUM_NODES=1
+fi
 if ! [[ "$NUM_NODES" =~ ^[0-9]+$ ]] || (( NUM_NODES < 1 )); then
   echo "❌ Number of nodes must be a positive integer (>=1)."
   exit 1
 fi
 
-read -p "Enter CRDB version (format v24.3.x): " CRDB_VERSION
+read -p "Enter CRDB version (format v24.3.x or 24.3.x, default v24.3.1): " CRDB_VERSION
+if [[ -z "$CRDB_VERSION" ]]; then
+  CRDB_VERSION="v24.3.1"
+fi
 
-# 1) validate basic format: must start with 'v' and have three numeric components
-if ! [[ "$CRDB_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  echo "❌ Invalid version format. Expected v<major>.<minor>.<patch> (e.g. v24.3.9)."
+# Accept versions with or without leading 'v'
+if ! [[ "$CRDB_VERSION" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "❌ Invalid version format. Expected v<major>.<minor>.<patch> or <major>.<minor>.<patch>."
   exit 1
 fi
 
-# 2) extract major.minor for comparison
-#    strip leading 'v' and trailing '.patch'
-MAJOR_MINOR="${CRDB_VERSION#v}"      # e.g. "24.3.9"
-MAJOR_MINOR="${MAJOR_MINOR%.*}"      # e.g. "24.3"
+# Normalize to leading 'v'
+if [[ "$CRDB_VERSION" != v* ]]; then
+  CRDB_VERSION="v${CRDB_VERSION}"
+fi
 
-# 3) now enforce supported bounds
+MAJOR_MINOR="${CRDB_VERSION#v}"
+MAJOR_MINOR="${MAJOR_MINOR%.*}"
+
 if [[ "$MAJOR_MINOR" < "24.3" ]]; then
   echo "❌ Version < 24.3 does not support LDR."
   exit 1
-elif [[ "$MAJOR_MINOR" == 25.* ]]; then
-  echo "❌ v25.x is not supported yet. Aborting."
+elif [[ "$MAJOR_MINOR" == "24.3" ]]; then
+  echo "✅ Detected v24.3.x — using Legacy LDR setup flow (CREATE LOGICAL REPLICATION STREAM)."
+  LDR_FLOW="legacy"
+elif [[ "$MAJOR_MINOR" =~ ^25\.[0-9]+$ ]]; then
+  echo "✅ Detected v25.x — supports both Legacy and Automatic LDR setup."
+  echo "--------------------------------------"
+  echo "What kind of setup do you want?"
+  echo "  - Tables WITHOUT user-defined types (enums, etc.) → Automatic setup (CREATE LOGICALLY REPLICATED TABLE)"
+  echo "  - Tables WITH user-defined types (enums, etc.) → Legacy setup (CREATE LOGICAL REPLICATION STREAM)"
+  echo "--------------------------------------"
+  read -p "Do you want to test with user-defined types (enums, etc.)? (yes/no): " HAS_UDT
+  lc_udt=$(echo "$HAS_UDT" | tr '[:upper:]' '[:lower:]')
+  if [[ "$lc_udt" == "yes" ]] || [[ "$lc_udt" == "y" ]]; then
+    echo "✅ Using Legacy setup (CREATE LOGICAL REPLICATION STREAM) - required for user-defined types"
+    LDR_FLOW="legacy"
+  else
+    echo "✅ Using Automatic setup (CREATE LOGICALLY REPLICATED TABLE) - automatic table creation and initial scan"
+    LDR_FLOW="auto"
+  fi
+else
+  echo "❌ Unsupported CockroachDB version: $CRDB_VERSION"
   exit 1
 fi
 
-read -p "Extend cluster lifetime? (yes/no): " EXTEND_CHOICE
+read -p "Extend cluster lifetime? (yes/no, default no): " EXTEND_CHOICE
 lc_extend=$(echo "$EXTEND_CHOICE" | tr '[:upper:]' '[:lower:]')
+if [[ -z "$lc_extend" ]]; then
+  lc_extend="no"
+fi
 if [[ "$lc_extend" == "yes" ]]; then
   read -p "Enter extension (e.g. 7h): " EXTEND_VAL
 fi
+
 echo "--------------------------------------"
 echo "🚀 Creating clusters..."
-# AWS login
 PROFILE=$(egrep sso_account_id ~/.aws/config -B 3 | grep profile | awk '{print $2}' | sed -e 's|\]||g')
 aws sso login --profile $PROFILE
 {
@@ -354,20 +709,9 @@ echo "✅ Clusters ready:"
 echo "   - $SRC_CLUSTER IP: $SRC_IP"
 echo "   - $TGT_CLUSTER IP: $TGT_IP"
 echo "--------------------------------------"
-# Prompt
-read -p "Choose LDR mode: (a) unidirectional or (b) bidirectional): " LDR_MODE
-lc_mode=$(echo "$LDR_MODE" | tr '[:upper:]' '[:lower:]')
 
-case "$lc_mode" in
-  a*)
-    run_unidirectional
-    ;;
-  b*)
-    echo "🔄 Choice selected is Bi-directional LDR: The Script will run Uni-directional first then setup Bi-directional LDR for the same database"
-    run_bidirectional
-    ;;
-  *)
-    echo "❌ Invalid LDR mode: must start with 'a' (uni) or 'b' (bi)"
-    exit 1
-    ;;
-esac
+if [[ "$LDR_FLOW" == "auto" ]]; then
+  run_auto_ldr_setup
+else
+  run_legacy_ldr_setup
+fi
