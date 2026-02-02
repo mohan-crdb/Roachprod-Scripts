@@ -36,6 +36,37 @@ This script automates the provisioning of two CockroachDB clusters and sets up L
 5. Extend cluster lifetime (default `no`)
 
 ### Example
+1. Run the script from the shell:
 ```bash
 ./roachprod_create_ldr/create-ldr-cluster-main.sh
+build-tag = v25.4.0 → SEC_FLAG='--secure'
+--------------------------------------
+Enter Cluster Details:
+--------------------------------------
+Enter source cluster name (format <username>-<cluster>): mohan-3
+Enter target cluster name (format <username>-<cluster>): mohan-4
+Enter number of nodes (>=1, default 1): 
+Enter CRDB version (format v24.3.x or 24.3.x, default v24.3.1): 25.2.1
+✅ Detected v25.x — supports both Legacy and Automatic LDR setup.
+--------------------------------------
+What kind of setup do you want?
+  - Tables WITHOUT user-defined types (enums, etc.) → Automatic setup (CREATE LOGICALLY REPLICATED TABLE)
+  - Tables WITH user-defined types (enums, etc.) → Legacy setup (CREATE LOGICAL REPLICATION STREAM)
+--------------------------------------
+Do you want to test with user-defined types (enums, etc.)? (yes/no): yes
+✅ Using Legacy setup (CREATE LOGICAL REPLICATION STREAM) - required for user-defined types
+Extend cluster lifetime? (yes/no, default no): 
+--------------------------------------
+🚀 Creating clusters...
+```
+2. Once the clusters are created, just select the type of LDR you want to setup:
+```
+✅ Clusters ready:
+   - mohan-3 IP: 10.142.0.28
+   - mohan-4 IP: 10.142.2.111
+--------------------------------------
+🚀 Running Legacy LDR setup flow for v25.2.1...
+--------------------------------------
+Choose LDR mode: (a) unidirectional or (b) bidirectional): b
+🔄 Running bidirectional LDR...
 ```
